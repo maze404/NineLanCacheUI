@@ -1,17 +1,12 @@
-﻿using Microsoft.Extensions.Configuration;
-using NineLanCacheUI_API.Data;
-using NineLanCacheUI_API.Services.OriginalDepotEnricher.Models;
-using System.Diagnostics;
-using System.Text.Json;
-using Microsoft.EntityFrameworkCore;
-using NineLanCacheUI_API.Data.Tables;
-namespace NineLanCacheUI_API.Services.OriginalDepotEnricher
+﻿using DeveLanCacheUI_Backend.Services.OriginalDepotEnricher.Models;
+
+namespace DeveLanCacheUI_Backend.Services.OriginalDepotEnricher
 {
     public class SteamDepotDownloaderHostedService : BackgroundService
     {
         public IServiceProvider Services { get; }
 
-        private readonly IConfiguration _configuration;
+        private readonly DeveLanCacheConfiguration _deveLanCacheConfiguration;
         private readonly SteamDepotEnricherHostedService _steamDepotEnricherHostedService;
         private readonly ILogger<SteamDepotDownloaderHostedService> _logger;
         private readonly HttpClient _httpClient;
@@ -19,12 +14,12 @@ namespace NineLanCacheUI_API.Services.OriginalDepotEnricher
         private const string DeveLanCacheUISteamDepotFinderLatestUrl = "https://api.github.com/repos/devedse/DeveLanCacheUI_SteamDepotFinder_Runner/releases/latest";
 
         public SteamDepotDownloaderHostedService(IServiceProvider services,
-            IConfiguration config,
+            DeveLanCacheConfiguration deveLanCacheConfiguration,
             SteamDepotEnricherHostedService steamDepotEnricherHostedService,
             ILogger<SteamDepotDownloaderHostedService> logger)
         {
             Services = services;
-            _configuration = config;
+            _deveLanCacheConfiguration = deveLanCacheConfiguration;
             _steamDepotEnricherHostedService = steamDepotEnricherHostedService;
             _logger = logger;
             _httpClient = new HttpClient();
@@ -40,7 +35,7 @@ namespace NineLanCacheUI_API.Services.OriginalDepotEnricher
 
         private async Task GoRun(CancellationToken stoppingToken)
         {
-            var deveLanCacheUIDataDirectory = _configuration["LanCacheUIDataDirectory"];
+            var deveLanCacheUIDataDirectory = _deveLanCacheConfiguration.DeveLanCacheUIDataDirectory;
             if (string.IsNullOrWhiteSpace(deveLanCacheUIDataDirectory))
             {
                 deveLanCacheUIDataDirectory = Directory.GetCurrentDirectory();
@@ -67,35 +62,16 @@ namespace NineLanCacheUI_API.Services.OriginalDepotEnricher
                     {
                         throw new UnreachableException($"New version available, but LatestVersion or DownloadUrl is null. This should not happen. LatestVersion: {shouldDownload.LatestVersion}, DownloadUrl: {shouldDownload.DownloadUrl}");
                     }
-                    var downloadedBytes = await GoDownload(depotFileDirectory, shouldDownload);
 
-                    if (downloadedBytes != null)
-                    {
-                        await _steamDepotEnricherHostedService.GoProcess(shouldDownload.LatestVersion, downloadedBytes, stoppingToken);
-                    }
-                    else
-                    {
-                        _logger.LogWarning("Downloaded depot file was null, not processing further.");
-                    }
+                    _logger.LogInformation("Detected that new version '{LatestVersion}' of Depot File is available, downloading: {DownloadUrl}...", shouldDownload.LatestVersion, shouldDownload.DownloadUrl);
+
+                    var downloadedBytes = await RemoteFileDownloader.DownloadFileAsync(shouldDownload.DownloadUrl, stoppingToken);
+
+                    await _steamDepotEnricherHostedService.GoProcess(shouldDownload.LatestVersion, downloadedBytes, stoppingToken);
                 }
 
                 await Task.Delay(TimeSpan.FromHours(1));
             }
-        }
-
-        private async Task<byte[]?> GoDownload(string depotFileDirectory, (bool NewVersionAvailable, Version? LatestVersion, string? DownloadUrl) shouldDownload)
-        {
-            _logger.LogInformation("Detected that new version '{NewVersionAvailable}' of Depot File is available, so downloading: {DownloadUrl}...", shouldDownload.NewVersionAvailable, shouldDownload.DownloadUrl);
-
-            var downloadedCsv = await _httpClient.GetAsync(shouldDownload.DownloadUrl);
-            if (!downloadedCsv.IsSuccessStatusCode)
-            {
-                _logger.LogWarning("Could not obtain {Url}: {StatusCode}, {ReasonPhrase}", DeveLanCacheUISteamDepotFinderLatestUrl, downloadedCsv.StatusCode, downloadedCsv.ReasonPhrase);
-                return null;
-            }
-
-            var bytes = await downloadedCsv.Content.ReadAsByteArrayAsync();
-            return bytes;
         }
 
         private async Task<(bool NewVersionAvailable, Version? LatestVersion, string? DownloadUrl)> NewDepotFileAvailable()
@@ -125,16 +101,20 @@ namespace NineLanCacheUI_API.Services.OriginalDepotEnricher
                 return (false, null, null);
             }
 
-            var downloadUrl = dataParsed.assets.FirstOrDefault(t => t.browser_download_url.EndsWith(".csv", StringComparison.OrdinalIgnoreCase))?.browser_download_url;
-            if (downloadUrl == null)
+            var asset = dataParsed.assets?.FirstOrDefault(a => a.name == "app-depot-output-cleaned.csv.gz")
+                        ?? dataParsed.assets?.FirstOrDefault(a => a.name == "app-depot-output-cleaned.csv");
+
+            if (asset == null || string.IsNullOrWhiteSpace(asset.browser_download_url))
             {
-                _logger.LogWarning("Could not find download url in: {Data}", data);
+                _logger.LogWarning("Could not find app-depot-output-cleaned.csv.gz or .csv in release assets");
                 return (false, null, null);
             }
 
+            var downloadUrl = asset.browser_download_url;
+
             await using (var scope = Services.CreateAsyncScope())
             {
-                using var dbContext = scope.ServiceProvider.GetRequiredService<NineLanCacheUIDBContext>();
+                using var dbContext = scope.ServiceProvider.GetRequiredService<DeveLanCacheUIDbContext>();
                 var foundSetting = await dbContext.Settings.FirstOrDefaultAsync(t => t.Key == DbSetting.SettingKey_DepotVersion);
                 if (foundSetting == null || foundSetting.Value == null)
                 {
